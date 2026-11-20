@@ -39,6 +39,14 @@
 //!   mostly across the boundary keeps it (`FixBoundaryTangents`,
 //!   `sm_FixBoundaryCurves`); flattening it would fold the trace into a cusp.
 //!   Exact boundary contacts flatten as upstream.
+//! - **Span direction.** Not upstream: `TestSpanAccuracy` also fails a span whose
+//!   image on the surface runs against the curve at one of its three samples (the
+//!   Hermite's UV tangent mapped by the surface's first derivatives there, against the
+//!   curve's tangent). Its samples test distance only, and beside a nearly singular
+//!   point of the surface (where `S_u` or `S_v` is short, or they are nearly parallel)
+//!   a span whose ends and end tangents are right can fold back inside the tolerance: a
+//!   hook whose radius of curvature on the surface is far below the curve's. Such a
+//!   span is halved, as one that misses the curve.
 //! - **Seam continuation.** A projected point across the seam keeps the same
 //!   seam side when the starting tangent runs along it. A crossing keeps the
 //!   existing 3D approximation bound; along the seam the two sides must be the
@@ -209,6 +217,39 @@ pub struct SpanAccuracy {
     pub max_drop_to_surf_param: f64,
     /// `rdMaxApproxDev`: the largest deviation from a surface normal line seen.
     pub max_approx_dev: f64,
+}
+
+/// Not upstream: whether the image on `surface` of the UV Hermite span `hermite` at its
+/// parameter `s` (its point `uv` there, clamped into the domain) runs against the curve
+/// tangent `crv_tan`: the Hermite's UV tangent mapped by the surface's first derivatives
+/// at `uv` has a negative dot product with it. A tangent that vanishes (a pole of the
+/// surface, a degenerate curve) gives zero, which is no evidence and passes; so does a
+/// surface that cannot be evaluated there (the distance test has already passed the
+/// point) and a non-finite product.
+///
+/// # Errors
+///
+/// [`SolidError::Unported`] and cancellation.
+fn runs_against(
+    k: &Kernel,
+    surface: &Surface,
+    hermite: &HermiteCurve,
+    s: f64,
+    uv: Point2,
+    crv_tan: Vec3,
+) -> Result<bool> {
+    let Some(uv_tan) =
+        crate::error::ignored(hermite.evaluate(s, 1, false))?.and_then(|d| d.get(1).copied())
+    else {
+        return Ok(false);
+    };
+    let Some((_, su, sv)) =
+        crate::error::ignored(surface.evaluate_1st_derivatives(k, uv, true, true))?
+    else {
+        return Ok(false);
+    };
+    let along = (su * uv_tan.x + sv * uv_tan.y).dot(crv_tan);
+    Ok(along < 0.0)
 }
 
 /// The `smsurf_IsPointOnNormal` outputs `TestSpanAccuracy` reads.
@@ -464,8 +505,10 @@ impl DropPt {
     /// point to `end` stays within `approx_tol_3d` of `curve` (`TestSpanAccuracy`):
     /// three interior samples must lie on surface normal lines through the curve
     /// points; spans shorter than a thousandth of their own parameter interval
-    /// always pass. `uv_tol_x`, `uv_tol_y` and `do_refinement` are not used
-    /// (upstream default `do_refinement = TRUE`).
+    /// always pass. Not upstream: a sample also fails where the span's image on the
+    /// surface runs against the curve there (see the module's "Span direction").
+    /// `uv_tol_x`, `uv_tol_y` and `do_refinement` are not used (upstream default
+    /// `do_refinement = TRUE`).
     ///
     /// # Errors
     ///
@@ -570,6 +613,15 @@ impl DropPt {
                 out.passes = false;
                 break;
             }
+
+            // not upstream: the span's image must run the way the curve runs. Its
+            // tangent there is the Hermite's UV tangent mapped by the surface's first
+            // derivatives; one that points against the curve's tangent folds the trim
+            // back on the surface, however close its points are
+            if runs_against(k, surface, &hermite, normalized_t, uv, crv_tan)? {
+                out.passes = false;
+                break;
+            }
             if drop_to_surf > out.max_drop_to_surf {
                 out.max_drop_to_surf = drop_to_surf;
                 out.max_drop_to_surf_param = start.t + normalized_t * delta_t;
@@ -580,6 +632,49 @@ impl DropPt {
         }
 
         Ok(out)
+    }
+
+    /// Not upstream: whether the image on `surface` of the cubic Hermite UV span from this
+    /// drop point to `end` (the span [`DropPt::test_span_accuracy`] tests) runs against
+    /// `curve` at one of that test's three samples (see the module's "Span direction").
+    /// The drop's span loop asks it of a pending endpoint dropped from an earlier start:
+    /// beside a nearly singular point of the surface many UV points lie within the
+    /// tolerance of one curve point, and an endpoint dropped from far back can lie on
+    /// another part of them than the span's actual start, so that no span between the two
+    /// runs the way the curve runs.
+    ///
+    /// # Errors
+    ///
+    /// [`SolidError::Unported`], cancellation, and those of the curve's evaluation.
+    pub fn span_runs_back(
+        &self,
+        k: &Kernel,
+        surface: &Surface,
+        uv_domain: &Extent2d,
+        curve: &Curve,
+        end: &Self,
+    ) -> Result<bool> {
+        let delta_t = end.t - self.t;
+        let hermite = HermiteCurve::from_2d(
+            self.uv_pd[0],
+            self.uv_pd[1] * delta_t,
+            end.uv_pd[0],
+            end.uv_pd[1] * delta_t,
+            2,
+        );
+        for ii in 1..=3_u32 {
+            let normalized_t = f64::from(ii) / 4.0;
+            let herm_pnt = hermite.evaluate_point(normalized_t);
+            let uv = uv_domain.clamp_point(Point2::new(herm_pnt.x, herm_pnt.y));
+            let crv = curve.evaluate(k, self.t + normalized_t * delta_t, 1, true, true)?;
+            let Some(crv_tan) = crv.get(1).copied() else {
+                return Ok(false);
+            };
+            if runs_against(k, surface, &hermite, normalized_t, uv, crv_tan)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Corrects a seam-side choice of `end.uv_pd[0]` when the step from this drop point

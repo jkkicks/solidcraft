@@ -73,7 +73,11 @@
 //!   back when it becomes the span end. Once a split point changes the start and the
 //!   new span jumps more than half a closed parameter domain, the endpoint is dropped
 //!   again from that start, so its seam branch is resolved from the actual start,
-//!   under the initial endpoint's pole, exit and approximation checks. A failed
+//!   under the initial endpoint's pole, exit and approximation checks. Not upstream
+//!   either: so is an endpoint whose span from that start runs back on the surface
+//!   ([`DropPt::span_runs_back`]; beside a nearly singular point many UV points lie
+//!   within the tolerance of one curve point, and an endpoint dropped from far back can
+//!   lie on another part of them than the start). A failed
 //!   redrop falls back, once, to the saved endpoint and does not end the trace: a
 //!   rejected point is never retried, so subdivision cannot loop on it.
 //!   An unresolved closed-direction seam jump cannot use
@@ -1527,9 +1531,10 @@ impl Surface {
                     // A pending endpoint was dropped relative to an earlier start. Its
                     // parameter and UV point and tangent are taken from the stack, as
                     // upstream. Only when the new span makes a closed-surface seam
-                    // branch ambiguous is the endpoint dropped again from the actual
-                    // start; a failed redrop falls back, once, to the saved point
-                    // (the path of the initial endpoint), and never ends the trace.
+                    // branch ambiguous, or runs back on the surface, is the endpoint
+                    // dropped again from the actual start; a failed redrop falls back,
+                    // once, to the saved point (the path of the initial endpoint), and
+                    // never ends the trace.
                     end.t = saved_end.t;
                     end.uv_pd = saved_end.uv_pd;
                     // (not upstream: with the knot lines its UV point is on)
@@ -1542,7 +1547,15 @@ impl Surface {
                             || srf_closure == SurfParamType::Both)
                             && (end.uv_pd[0].y - start.uv_pd[0].y).abs()
                                 > srf_nat_domain.v_interval().length() / 2.0);
-                    if queued_start_t != start.t && ambiguous_seam {
+                    // (not upstream: nor when the span from the actual start to it runs
+                    // back on the surface, `DropPt::span_runs_back`: beside a nearly
+                    // singular point the endpoint can lie on another part of the points
+                    // within the tolerance of its curve point than the start)
+                    let moved_start = queued_start_t != start.t;
+                    let runs_back = moved_start
+                        && !ambiguous_seam
+                        && start.span_runs_back(k, this, &s_uv_domain, curve, &end)?;
+                    if moved_start && (ambiguous_seam || runs_back) {
                         let mut redrop = saved_end;
                         let status = match start.get_next_point(
                             k,
@@ -2438,5 +2451,188 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The plane patch `(u, v^2 + v / 100, 0)` over `[0, 1]^2`: bilinear in u, quadratic
+    /// in v (its v net `0`, `1 / 200`, `1.01`). Its side `v = 0` nearly collapses: `Sv`
+    /// is `(0, 2 v + 1 / 100, 0)`, a hundredth long there. A curve leaving that side
+    /// has a UV curve that rises in v as the square root of the distance: `y = t` is `v
+    /// = (sqrt(1e-4 + 4 t) - 1e-2) / 2`, ten times as fast at `t = 0` as at `t = 2.5e-3`.
+    fn plane_with_a_nearly_collapsed_side() -> Surface {
+        let e = 0.01;
+        let net: Vec<Vec<CPoint>> = [0.0, 1.0]
+            .iter()
+            .map(|&x| {
+                vec![
+                    CPoint::new(x, 0.0, 0.0, NOW),
+                    CPoint::new(x, e / 2.0, 0.0, NOW),
+                    CPoint::new(x, 1.0 + e, 0.0, NOW),
+                ]
+            })
+            .collect();
+        let u = [0.0, 0.0, 1.0, 1.0];
+        let v = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        Surface::from(BSplineSurface::from_data(1, 2, 1, 2, 3, 5, &net, &u, &v).unwrap())
+    }
+
+    /// A span whose image runs back. The line `(0.5 + 0.3 t, t, 0)`, `t` in `[0, 0.5]`,
+    /// leaves the nearly collapsed side of [`plane_with_a_nearly_collapsed_side`], and
+    /// is a polyline with a knot at `t = 3e-3`, so the drop's first span is `[0, 3e-3]`.
+    /// The span's Hermite has the exact UV ends and tangents (`u' = 0.3` and `v' = 1 /
+    /// sqrt(1e-4 + 4 t)`, 100 then about 9.1), but between them it overshoots the square
+    /// root in v; with `y = v^2 + v / 100` the image there runs back along the line
+    /// (least cosine -0.43 against the line's direction, measured) while its points stay
+    /// within 2.1e-4 of the line, inside the tolerance of 1e-3. Upstream's test reads the
+    /// distance only and kept the span: a hook in the trim whose radius of curvature on
+    /// the surface is far below the line's (none). The span now fails where its image
+    /// runs against the curve and is halved, so the image runs along the line everywhere
+    /// and stays within the tolerance of it.
+    #[test]
+    fn a_drop_span_whose_image_runs_back_beside_a_nearly_collapsed_side_is_halved() {
+        use crate::nurbs::b_spline_curve::p1::{BSplineCurveForm, CanonicalData, KnotType};
+        let k = Kernel::default();
+        let surface = plane_with_a_nearly_collapsed_side();
+        let domain = Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0);
+        let interval = Extent1d::from_min_max(0.0, 0.5);
+        let line = |t: f64| Point3::new(0.5 + 0.3 * t, t, 0.0);
+        let knots = [0.0, 3e-3, 0.5];
+        let points: Vec<Point3> = knots.iter().map(|&t| line(t)).collect();
+        let curve = Curve::from(
+            BSplineCurve::create_canonical(&CanonicalData {
+                dim: 3,
+                degree: 1,
+                control_points: &points,
+                form: BSplineCurveForm::Unspecified,
+                knot_multiplicities: &[2, 1, 2],
+                knots: &knots,
+                knot_type: KnotType::Unspecified,
+                weights: None,
+                trim: None,
+            })
+            .unwrap(),
+        );
+        let tol = 1e-3;
+        let dropped = surface
+            .drop_curve::<NoObject>(&k, &domain, &curve, &interval, tol, true, None, true)
+            .unwrap();
+        assert_eq!(dropped.uv_curves.len(), 1, "{dropped:?}");
+        let uv = &dropped.uv_curves[0];
+        let direction = Vec3::new(0.3, 1.0, 0.0);
+        let (mut least_cos, mut worst_gap) = (f64::MAX, 0.0_f64);
+        for i in 1..6000 {
+            let t = f64::from(i) * 0.5 / 6000.0;
+            let d = uv.evaluate(&k, t, 1, true, false).unwrap();
+            let (_, su, sv) = surface
+                .evaluate_1st_derivatives(&k, Point2::new(d[0].x, d[0].y), true, true)
+                .unwrap();
+            let image = su * d[1].x + sv * d[1].y;
+            least_cos = least_cos.min(image.dot(direction) / (image.length() * direction.length()));
+            let p = surface
+                .evaluate_point(&k, Point2::new(d[0].x, d[0].y))
+                .unwrap();
+            // the distance from the line x = 0.5 + 0.3 y
+            worst_gap = worst_gap.max((p.x - 0.5 - 0.3 * p.y).abs() / direction.length());
+        }
+        assert!(
+            least_cos > 0.0 && worst_gap <= tol,
+            "least cosine {least_cos} against the line, {worst_gap} off it"
+        );
+    }
+
+    /// A bicubic patch over `[0, 1]^2`, the regular grid `(i / 3, j / 3)` raised by 0.3
+    /// at its four inner control points, whose corner `(u, v) = (0, 1)` is nearly
+    /// singular: the control point beside it, `P[0][2]`, is moved to 1e-5 from it, almost
+    /// along u (`(-1e-5, -1e-7, 0)` from `P[0][3]`). There `Sv` is 3e-5 long and nearly
+    /// parallel to `Su`, so beside the corner many UV points lie within a small distance
+    /// of one point off the surface.
+    fn patch_with_a_nearly_singular_corner() -> Surface {
+        let mut net: Vec<Vec<CPoint>> = (0..4)
+            .map(|i| {
+                (0..4)
+                    .map(|j| {
+                        let inner = (1..=2).contains(&i) && (1..=2).contains(&j);
+                        let z = if inner { 0.3 } else { 0.0 };
+                        CPoint::new(f64::from(i) / 3.0, f64::from(j) / 3.0, z, NOW)
+                    })
+                    .collect()
+            })
+            .collect();
+        net[0][2] = CPoint::new(-1e-5, 1.0 - 1e-7, 0.0, NOW);
+        let knots = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        Surface::from(BSplineSurface::from_data(3, 3, 3, 3, 7, 7, &net, &knots, &knots).unwrap())
+    }
+
+    /// A pending end dropped from far back. The curve leaves the nearly singular corner of
+    /// [`patch_with_a_nearly_singular_corner`]: a polyline through the surface points of the
+    /// UV line `(0.6 t, 1 - 0.6 t)`, `t` in `[0, 1]`, each 1e-5 off the surface along its
+    /// normal, with a knot at `t = 0.01` and 200 equal steps after it; tolerance 5e-4.
+    /// The trim's image ran back along the curve (cosine -0.9995 against it, measured).
+    /// With spans that run back halved but their pending end kept, it still did (-0.999):
+    /// beside the corner the end, dropped from the start over the whole span, and the
+    /// points the halving drops can lie on different parts of the UV points within reach
+    /// of the curve. The pending end is now dropped again from the actual start when the
+    /// span to it runs back, as when a span makes a seam branch ambiguous, and the image
+    /// runs the way the curve runs everywhere, within the tolerance of it.
+    #[test]
+    fn a_pending_drop_end_whose_span_runs_back_beside_a_nearly_singular_corner_is_dropped_again() {
+        use crate::nurbs::b_spline_curve::p1::{BSplineCurveForm, CanonicalData, KnotType};
+        let k = Kernel::default();
+        let surface = patch_with_a_nearly_singular_corner();
+        let domain = Extent2d::from_bounds(0.0, 0.0, 1.0, 1.0);
+        let interval = Extent1d::from_min_max(0.0, 1.0);
+        let off_surface = |t: f64| {
+            let (p, su, sv) = surface
+                .evaluate_1st_derivatives(&k, Point2::new(0.6 * t, 1.0 - 0.6 * t), true, true)
+                .unwrap();
+            let normal = su.cross(sv);
+            let length = normal.length();
+            if length > 0.0 {
+                p + normal * (1e-5 / length)
+            } else {
+                p
+            }
+        };
+        let mut knots = vec![0.0, 0.01];
+        knots.extend((1..=200).map(|i| 0.01 + 0.99 * f64::from(i) / 200.0));
+        let points: Vec<Point3> = knots.iter().map(|&t| off_surface(t)).collect();
+        let mut multiplicities = vec![1; knots.len()];
+        multiplicities[0] = 2;
+        multiplicities[knots.len() - 1] = 2;
+        let curve = Curve::from(
+            BSplineCurve::create_canonical(&CanonicalData {
+                dim: 3,
+                degree: 1,
+                control_points: &points,
+                form: BSplineCurveForm::Unspecified,
+                knot_multiplicities: &multiplicities,
+                knots: &knots,
+                knot_type: KnotType::Unspecified,
+                weights: None,
+                trim: None,
+            })
+            .unwrap(),
+        );
+        let tol = 5e-4;
+        let dropped = surface
+            .drop_curve::<NoObject>(&k, &domain, &curve, &interval, tol, true, None, true)
+            .unwrap();
+        assert_eq!(dropped.uv_curves.len(), 1, "{dropped:?}");
+        let uv = &dropped.uv_curves[0];
+        let (mut least_cos, mut worst_gap) = (f64::MAX, 0.0_f64);
+        for i in 1..4000 {
+            let t = f64::from(i) / 4000.0;
+            let d = uv.evaluate(&k, t, 1, true, false).unwrap();
+            let (p, su, sv) = surface
+                .evaluate_1st_derivatives(&k, Point2::new(d[0].x, d[0].y), true, true)
+                .unwrap();
+            let image = su * d[1].x + sv * d[1].y;
+            let c = curve.evaluate(&k, t, 1, true, false).unwrap();
+            least_cos = least_cos.min(image.dot(c[1]) / (image.length() * c[1].length()));
+            worst_gap = worst_gap.max(p.distance(c[0]));
+        }
+        assert!(
+            least_cos > 0.0 && worst_gap <= tol,
+            "least cosine {least_cos} against the curve, {worst_gap} off it"
+        );
     }
 }
